@@ -10,13 +10,14 @@ from threading import Event
 from unittest.mock import patch
 
 import test_external_verification
+from jsonschema import Draft202012Validator
 from test_projects import git, repository
 
-from reposteward.mcp_bridge import SCHEMAS, ScopedBridge, create_server
-from reposteward.mcp_config import client_config
-from reposteward.projects import ProjectError
-from reposteward.verifier import DockerVerifier
-from reposteward.workspace import sanitized_environment
+from reposteward.integrations.mcp import SCHEMAS, ScopedBridge, create_server
+from reposteward.integrations.mcp_config import client_config
+from reposteward.projects.registry import ProjectError
+from reposteward.storage.workspace import sanitized_environment
+from reposteward.verification.verifier import DockerVerifier
 
 HAS_MCP = importlib.util.find_spec("mcp") is not None
 
@@ -29,7 +30,7 @@ class BridgeTests(unittest.TestCase):
         self.bridge = ScopedBridge(self.config, self.repo)
 
     def test_understanding_is_read_only_and_matches_shared_service(self):
-        from reposteward.understanding import Understanding
+        from reposteward.projects.understanding import Understanding
 
         service = Understanding(self.config.state_dir / "understanding")
         self.assertEqual(
@@ -161,6 +162,9 @@ class BridgeTests(unittest.TestCase):
             async with Client(create_server(self.config, self.repo)) as client:
                 listing = await client.list_tools()
                 self.assertEqual({tool.name for tool in listing.tools}, set(SCHEMAS))
+                for tool in listing.tools:
+                    self.assertIsNotNone(tool.output_schema)
+                    Draft202012Validator.check_schema(tool.output_schema)
                 project = await client.call_tool("project", {})
                 self.assertEqual(
                     project.structured_content["project"]["id"], self.task["project_id"]
@@ -197,6 +201,21 @@ class BridgeTests(unittest.TestCase):
                 )
                 self.assertEqual(verified.structured_content["outcome"], "passed")
                 self.assertFalse(verified.structured_content["publication_eligible"])
+                for name, response in (
+                    ("project", project),
+                    ("context", context),
+                    ("evidence", evidence),
+                    ("understanding", understanding),
+                    ("checkpoint", cp),
+                    ("verification", verified),
+                ):
+                    schema = next(
+                        t.output_schema for t in listing.tools if t.name == name
+                    )
+                    Draft202012Validator(schema).validate(response.structured_content)
+                error = await client.call_tool("context", {"run_id": "0" * 32})
+                self.assertTrue(error.is_error)
+                self.assertEqual(error.structured_content["error"]["code"], "not_found")
 
         with (
             patch.object(DockerVerifier, "image_available", return_value=True),
@@ -205,6 +224,25 @@ class BridgeTests(unittest.TestCase):
             ),
         ):
             asyncio.run(run())
+
+    @unittest.skipUnless(HAS_MCP, "install reposteward[mcp] for SDK protocol tests")
+    def test_invalid_application_output_becomes_a_safe_structured_error(self):
+        from mcp import Client
+
+        async def run():
+            async with Client(create_server(self.config, self.repo)) as client:
+                with patch.object(
+                    ScopedBridge, "call", return_value={"secret": "bad-result"}
+                ):
+                    response = await client.call_tool("project", {})
+                self.assertTrue(response.is_error)
+                self.assertEqual(
+                    response.structured_content["error"]["code"],
+                    "result_contract_error",
+                )
+                self.assertNotIn("bad-result", response.content[0].text)
+
+        asyncio.run(run())
 
     def stdio_environment(self) -> tuple[dict, list[str]]:
         user_root = self.root / "client-config"
@@ -220,6 +258,13 @@ class BridgeTests(unittest.TestCase):
             '[repositories."owner/repo"]',
         ]
         for key, value in asdict(self.config.repositories["owner/repo"]).items():
+            if key in {"verification_hosts", "env_template_booleans"}:
+                entries = ", ".join(
+                    f"{json.dumps(host)} = {json.dumps(address)}"
+                    for host, address in value
+                )
+                lines.append(f"{key} = {{ {entries} }}")
+                continue
             if key != "name" and value is not None:
                 lines.append(f"{key} = {json.dumps(value)}")
         user_file.write_text("\n".join(lines) + "\n")
@@ -245,6 +290,9 @@ class BridgeTests(unittest.TestCase):
         from mcp import Client, StdioServerParameters
 
         environment, arguments = self.stdio_environment()
+        from reposteward.projects.understanding import Understanding
+
+        Understanding(self.config.state_dir / "understanding").scan(self.repo)
 
         async def run():
             for mode in ("legacy", "2026-07-28"):
@@ -259,6 +307,19 @@ class BridgeTests(unittest.TestCase):
                     self.assertEqual(
                         {tool.name for tool in listing.tools}, set(SCHEMAS)
                     )
+                    operation = await client.call_tool(
+                        "operation",
+                        {
+                            "action": "start_understanding",
+                            "idempotency_key": "stdio-report",
+                        },
+                    )
+                    self.assertFalse(operation.is_error)
+                    identifier = operation.structured_content["id"]
+                    observed = await client.call_tool(
+                        "operation", {"action": "get", "operation_id": identifier}
+                    )
+                    self.assertEqual(observed.structured_content["state"], "pending")
                     result = await client.call_tool(
                         "context", {"run_id": self.task["run_id"]}
                     )
@@ -278,7 +339,7 @@ class BridgeTests(unittest.TestCase):
     def test_sdk_cancellation_reaches_worker_and_waits_for_cleanup(self) -> None:
         from mcp import Client
 
-        from reposteward.external_verification import ExternalVerification
+        from reposteward.verification.external import ExternalVerification
 
         started, cancelled, finished = Event(), Event(), Event()
 

@@ -166,6 +166,41 @@ image；项目安全设置只能收紧用户限额和默认禁止路径，不能
 未跟踪文件、符号链接、`.env` 文件、仓库根级 `secrets`/`credentials` 前缀和包含通配符或父目录
 跳转的路径仍会失败关闭。每个授权前缀都会写入验证沙箱清单，便于 Review 时核对。
 
+已跟踪的 `.env.example`、`.env.sample` 和 `.env.template` 可以进入验证快照，但敏感字段只允许
+空值或严格的占位符：`replace-with-<名称>`、`your-<提供方>-api-key`。名称和提供方仅允许小写
+ASCII 字母、数字及分隔非空片段的连字符；整个占位符不能加引号且最多 128 字符。模板仍须满足
+文件大小、UTF-8、普通文件、目录和赋值语法检查；其他非空敏感值继续拒绝，错误只报告位置。
+
+若已审阅应用代码，确认某个敏感后缀字段实际是布尔开关，可以在**可信用户配置**中声明精确字段名
+及允许的字符串值。例如以下声明仅允许 RoutePilot 的两个开发认证开关取关闭值 `0`：
+
+```toml
+[repositories."tiammomo/RoutePilot".env_template_booleans]
+ROUTEPILOT_V1_DEV_AUTH = ["0"]
+ROUTEPILOT_BFF_DEV_AUTH = ["0"]
+```
+
+每个仓库最多声明 64 个字段，字段名大小写敏感，最长 128 字符，须为 ASCII 环境变量名；不支持
+通配符、前缀或后缀匹配。每个值列表须为 `"0"`、`"1"`、`"false"`、`"true"`、`"no"`、`"yes"`
+的非空、不重复子集。在模板中这些值必须是无引号、无行尾注释的精确字面量；原有空值写法仍允许。
+已声明字段的其他非空值（包括占位符）均拒绝。不要将真实凭据字段声明为开关。
+
+仓库项目配置不能添加或扩大声明，其他仓库不继承声明。未声明字段继续使用原扫描规则；真实 `.env`
+文件、未跟踪模板和非普通文件仍不适用该许可。任务快照、验证副本、bootstrap 与最终验证使用同一
+规则，声明写入沙箱清单并绑定策略和验证摘要；更改声明后必须重新建立任务及验证证据。
+
+若测试使用模拟 HTTP 客户端却仍解析测试域名，可以在可信用户配置中为单个仓库设置静态 IPv4
+映射。项目配置不能添加或覆盖这些映射：
+
+```toml
+[repositories."bytedance/deer-flow".verification_hosts]
+"example.com" = "93.184.216.34"
+```
+
+映射以 Docker `--add-host` 参数传给该仓库的安装和验证容器，并记入沙箱清单。其他仓库不受影响；
+验证仍使用 `--network none`。地址仅作为测试夹具的解析结果，不会启用网络访问。不支持 IPv6、
+`host-gateway` 或非法主机名。Node 等依赖仍须在联网 bootstrap 阶段预装。
+
 ### 并发与变更规模
 
 默认情况下，每个仓库最多同时保留 4 个由当前 GitHub 账号创建的 open PR；Draft 和 Ready 都计入，
@@ -634,8 +669,9 @@ Claude Code 或 DeepSeek 等实现时可以共享流程，又不会让每次调�
 技能元数据和正文都属于仓库不可信输入。RepoSteward 不读取越出工作区的链接，frontmatter 最多
 扫描 8 KiB，单个技能文件上限为 1 MiB；Prompt 中的目录值会保持在 JSON 边界内，技能不能放宽
 凭据、网络或公开写入门禁。
-历史 Context Pack v1 与 Bundle v1 仍可严格校验和导入，新生成的文档使用 Context Pack/Bundle v2，
-Checkpoint 保持独立的 v1 协议。
+历史 Context Pack/Bundle v1、v2 仍可严格校验和导入，新生成的文档使用 v3，
+在技能目录基础上增加精确任务契约和修复反馈绑定。Checkpoint 保持独立的 v1 协议。
+完整版本边界与当前安装的核对方式见[协议与兼容性索引](protocol-map.zh-CN.md)。
 
 ## 提交与跟进
 
@@ -870,6 +906,12 @@ Context Pack / Portable Bundle v3 把 `task_contract`、`repair_feedback` 与 `c
 最小必须集合无法放入预算时明确失败，需要增加预算或明确审阅更短的契约。
 `coverage` 记录描述、检查点字段和列表、skills 目录的省略数量、原因、来源和摘要。
 
+原生编码提示的完整预算会优先裁减可取回的历史笔记、已完成声明和观察测试。
+已生成交接中的未完成事项、决定、阻塞、下一步、风险与证据不会为适应预算而整体丢弃；
+这些内容仍放不下时返回 `ContextBudgetError`，需要提高预算或明确核对检查点。
+此保证作用于已经生成的交接；检查点生成阶段的字段数量和长度限制仍通过 `coverage`
+披露，必要时应沿来源取回完整记录。历史声明仍需核验，不代表当前代码已通过测试。
+
 ## 维护者修复同仓库 PR
 
 `repair <submitted-run-id>` 支持 `mode="maintainer"` 且
@@ -1042,6 +1084,8 @@ reposteward knowledge promote <run-id> <knowledge-id> --reviewed-by your-login \
   --basis verification_evidence --verification-id verification:<id> --rationale "说明哪些测试支持这条经验"
 reposteward knowledge list <run-id> --scope-path src --limit 5
 reposteward knowledge inspect <run-id> <knowledge-id> --live
+reposteward knowledge withdraw <run-id> <knowledge-id> --reviewed-by your-login --reason "结论不适用"
+reposteward knowledge reject <run-id> <knowledge-id> --reviewed-by your-login --reason "证据不足"
 reposteward task context <run-id> --scope-path src --format markdown
 ```
 
@@ -1053,6 +1097,21 @@ reposteward task context <run-id> --scope-path src --format markdown
 变化后，条目显示 `stale` 并从默认提示中移除；路径之外的编辑不自动使其失效。
 声明路径也承担重验范围，需要审阅人确认依赖范围完整。查询只核对本地证据，线上
 来源是否更新仍需明确刷新。`--all` 可查看候选、过期与被替代条目。
+
+查询先筛选状态与路径范围，再按更新时间及 ID 降序核对最多 200 条匹配记录。
+新增候选和无关路径不会挤出范围内的已审阅知识。`scanned` 是本次核对数量，
+`suppressed` 是其中未通过有效性检查的数量，`omitted` 只统计本次窗口内超过返回
+上限的有效结果，不是整个项目的遗漏总数。`scan_incomplete` 表示还有未核对记录。
+只要 `next_cursor` 非空，即可沿用同一范围和 `--all` 设置继续查询；即使当前页为空也应如此：
+
+```bash
+reposteward knowledge list <run-id> --scope-path src --cursor <next-cursor>
+```
+
+游标绑定项目、工作区和查询范围；它只定位下一页，不授予访问或审阅权限。
+分页是实时视图，期间条目被审阅或替代会改变排序；需要最新完整视图时从首重新查询，
+并按 ID 去重。task context 的 `knowledge` 保留同样的继续线索，Agent 可以通过 CLI
+按需取回，避免一次把全部历史知识送入提示。
 
 更新经验时在新提案中设置 `supersedes`，新提案审阅通过后才原子替代旧条目，保留
 历史关系。重复提案和相同审阅幂等。跨项目查询隔离，不自动把业务经验升级为通用
@@ -1093,3 +1152,61 @@ reposteward overview show --previous-digest <digest>
 证据，仍需审阅余项、形成干净提交并走 adopt；视图不自动提交、发布或合并。
 
 已有 Coding Agent 的项目关联、接续、独立验证与当前能力限制见[使用指南](coding-agent-assistance.zh-CN.md)。
+
+
+### 撤回与拒绝项目知识
+
+`knowledge withdraw` 将已审阅经验置为 `withdrawn`，`knowledge reject` 将候选置为
+`rejected`。两者都要求配置中的维护者身份和 1–2000 字符的原因，不写 GitHub。
+即使来源已经陈旧，也可以明确停用；任务身份和工作区绑定仍需有效。
+默认查询及任务上下文排除这些记录。`inspect` 和 `list --all` 保留原审阅、来源、
+停用原因与时间；状态和单条终态决策在同一事务中保存，重复相同决策幂等，冲突决策拒绝。
+终态记录不能重新晋升。需要修正时提出带 `supersedes` 的新候选并重新审阅，旧记录
+保留停用状态和原因，同时指向后继。停用是维护者决定，不是自动推导的测试结论。
+
+此功能需要任务数据库 schema 27。先停止旧写入客户端，按
+[状态升级指南](state-upgrades.zh-CN.md)备份并显式迁移；只读查询不会自动升级。
+
+### 技能使用事件与效果证据
+
+在已创建的外部任务上显式记录技能使用；此入口不读取聊天记录、不安装客户端 hook，
+不会自动捕获所有技能调用。调用方先对实际使用的技能文件计算 SHA256，再提交 JSON：
+
+```json
+{
+  "event_id": "event-001",
+  "attempt_id": "attempt-001",
+  "revision": 0,
+  "skill_name": "verify-change",
+  "skill_digest": "替换为实际技能文件的64位小写SHA256",
+  "phase": "loaded",
+  "client": "codex",
+  "model": "填写实际模型标识或unknown",
+  "trigger": "change_verification"
+}
+```
+
+```sh
+reposteward skill-usage record <run-id> --input skill-event.json
+reposteward skill-usage report <run-id> --limit 50
+reposteward skill-usage report <run-id> --cursor <next-cursor>
+```
+
+`phase` 区分 `visible`、`loaded`、`executed`、`skipped`；`trigger` 支持
+`project_understanding`、`task_resume`、`change_verification`、`pr_maintenance`、`other`。
+标识字段只接受有界、无空白的标识符，不接受命令或聊天正文字段。输入文件最多 8192 字节。
+同一动作尝试使用相同 `attempt_id`；各阶段使用不同 `event_id`，传输重试复用原事件 ID。
+同一尝试、技能名称及摘要、阶段不能以另一个 ID 重复记录。摘要和执行阶段是调用方声明，
+报告标记 `agent_reported` / `caller_reported`，不是服务端自动观察到的执行事实。
+
+执行阶段可附 `verification_id: "verification:<id>"`，必须引用同一任务、同一 revision
+的终态验证。记录只保存引用及摘要，不复制验证正文。报告重新核对证据是否变化，展示
+当时的验证结果；`current_applicability=not_checked` 不代表当前工作区仍通过验证。
+失败验证也能记录；验证通过不能证明某技能导致成功。报告不产生技能成功率或节约比例。
+
+报告每次最多 100 个事件，游标绑定任务、项目与工作区；`page_counts` 只统计当前页，
+跨页的 `attempts` 不可直接相加。完整分析须取完分页并按 run、attempt、技能版本和模型
+去重分组，关联既有 usage 与验证台账，不能重复计入 token。任务 revision 改变后拒绝
+新的旧 revision 事件；完全相同的已存事件重试仍返回原记录。
+此能力仅提供可观测采集，暂不自动生成或应用技能改进规则。需要任务库 schema 28；
+升级前停止旧写入客户端并按状态升级指南保存备份。
